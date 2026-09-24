@@ -574,19 +574,8 @@ uci set firewall.iot_dns2.proto="tcp udp"
 uci set firewall.iot_dns2.family="ipv4"
 uci set firewall.iot_dns2.target="ACCEPT"
 
-# Redirect IPv4 DNS queries sent to any other destination to DNS1.
-# src_dip excludes the two approved local Pi-hole addresses, so a client
-# configured explicitly with DNS1 or DNS2 continues to reach that server.
-uci set firewall.iot_redirect_dns="redirect"
-uci set firewall.iot_redirect_dns.name="Redirect-IoT-DNS-to-${DNS1}"
-uci set firewall.iot_redirect_dns.src="iot"
-uci set firewall.iot_redirect_dns.src_dip="!${DNS1} !${DNS2}"
-uci set firewall.iot_redirect_dns.src_dport="53"
-uci set firewall.iot_redirect_dns.dest_ip="$DNS1"
-uci set firewall.iot_redirect_dns.dest_port="53"
-uci set firewall.iot_redirect_dns.proto="tcp udp"
-uci set firewall.iot_redirect_dns.family="ipv4"
-uci set firewall.iot_redirect_dns.target="DNAT"
+# DNS redirect is implemented by the generated nftables drop-in below.
+# Do not use src_dip with multiple negated addresses: fw4/UCI rejects it.
 
 uci set firewall.iot_block_lan_dot="rule"
 uci set firewall.iot_block_lan_dot.name="Block-IoT-LAN-DNS-over-TLS"
@@ -628,17 +617,8 @@ uci set firewall.xbox_dns2.proto="tcp udp"
 uci set firewall.xbox_dns2.family="ipv4"
 uci set firewall.xbox_dns2.target="ACCEPT"
 
-# Redirect IPv4 DNS queries sent to any other destination to DNS1.
-uci set firewall.xbox_redirect_dns="redirect"
-uci set firewall.xbox_redirect_dns.name="Redirect-Xbox-DNS-to-${DNS1}"
-uci set firewall.xbox_redirect_dns.src="xbox"
-uci set firewall.xbox_redirect_dns.src_dip="!${DNS1} !${DNS2}"
-uci set firewall.xbox_redirect_dns.src_dport="53"
-uci set firewall.xbox_redirect_dns.dest_ip="$DNS1"
-uci set firewall.xbox_redirect_dns.dest_port="53"
-uci set firewall.xbox_redirect_dns.proto="tcp udp"
-uci set firewall.xbox_redirect_dns.family="ipv4"
-uci set firewall.xbox_redirect_dns.target="DNAT"
+# DNS redirect is implemented by the generated nftables drop-in below.
+# Do not use src_dip with multiple negated addresses: fw4/UCI rejects it.
 
 uci set firewall.xbox_block_lan_dot="rule"
 uci set firewall.xbox_block_lan_dot.name="Block-Xbox-LAN-DNS-over-TLS"
@@ -658,7 +638,33 @@ uci set firewall.xbox_block_dot.proto="tcp udp"
 uci set firewall.xbox_block_dot.family="ipv4"
 uci set firewall.xbox_block_dot.target="REJECT"
 
+# ============================================================
+# DNS redirect nftables drop-in
+# ============================================================
+# fw4/UCI cannot express:
+#   destination != DNS1 AND destination != DNS2
+# using src_dip. Native nftables can express both exclusions.
+#
+# Approved Pi-hole destinations are left untouched. Every other
+# IPv4 DNS query from IoT/Xbox is DNATed to DNS1.
+DNS_REDIRECT_DROPIN="/etc/nftables.d/91-iot-xbox-dns-redirect.nft"
+mkdir -p /etc/nftables.d
+
+cat > "$DNS_REDIRECT_DROPIN" <<EOF
+chain iot_xbox_dns_redirect {
+    type nat hook prerouting priority dstnat; policy accept;
+    ip saddr $IOT_NET ip daddr != $DNS1 ip daddr != $DNS2 udp dport 53 dnat ip to $DNS1:53 comment "Redirect-IoT-DNS-to-$DNS1"
+    ip saddr $IOT_NET ip daddr != $DNS1 ip daddr != $DNS2 tcp dport 53 dnat ip to $DNS1:53 comment "Redirect-IoT-DNS-to-$DNS1-TCP"
+    ip saddr $XBOX_NET ip daddr != $DNS1 ip daddr != $DNS2 udp dport 53 dnat ip to $DNS1:53 comment "Redirect-Xbox-DNS-to-$DNS1"
+    ip saddr $XBOX_NET ip daddr != $DNS1 ip daddr != $DNS2 tcp dport 53 dnat ip to $DNS1:53 comment "Redirect-Xbox-DNS-to-$DNS1-TCP"
+}
+EOF
+
 uci commit firewall
+
+if command -v fw4 >/dev/null 2>&1; then
+    fw4 check || die "fw4 validation failed. Firewall was not restarted."
+fi
 
 service firewall restart
 sleep 2
@@ -739,27 +745,29 @@ uci -q get dhcp.xbox.ra || true
 
 echo ""
 echo "--- DNS redirect configuration ---"
-for section in iot_redirect_dns xbox_redirect_dns; do
-    if uci -q get "firewall.$section" >/dev/null 2>&1; then
-        echo "$section: OK"
-        uci show "firewall.$section" || true
-    else
-        echo "$section: MISSING"
-    fi
-done
+echo "Legacy UCI redirect sections (should be absent):"
+uci show firewall | grep -E 'firewall\.(iot_redirect_dns|xbox_redirect_dns)' || \
+    echo "  none"
+echo "nftables drop-in:"
+if [ -f /etc/nftables.d/91-iot-xbox-dns-redirect.nft ]; then
+    sed 's/^/  /' /etc/nftables.d/91-iot-xbox-dns-redirect.nft
+else
+    echo "  MISSING"
+fi
 
 echo ""
 echo "--- Effective DNS DNAT rules ---"
 if command -v fw4 >/dev/null 2>&1; then
     fw4 print 2>/dev/null | grep -E \
-        'Redirect-(IoT|Xbox)-DNS|ip daddr .* dnat to' || true
+        'iot_xbox_dns_redirect|Redirect-(IoT|Xbox)-DNS|dnat ip to' || true
 fi
 if command -v nft >/dev/null 2>&1; then
-    echo "dstnat:"
-    nft list chain inet fw4 dstnat 2>/dev/null || true
+    echo "nftables DNS redirect chain:"
+    nft list chain inet fw4 iot_xbox_dns_redirect 2>/dev/null || true
 fi
 
 echo ""
+
 echo "--- VLAN firewall DNS paths ---"
 for chain in forward_iot forward_xbox; do
     echo "### $chain"
@@ -789,8 +797,8 @@ echo "  nslookup xbox.com $DNS2"
 echo ""
 echo "Expected:"
 echo "  - External fixed DNS (8.8.8.8 / 1.1.1.1 / 9.9.9.9): SUCCESS"
-echo "  - The query must be redirected to the local Pi-hole path."
-echo "  - DNS1/DNS2: SUCCESS"
+echo "  - The query must be DNATed to DNS1."
+echo "  - DNS1/DNS2: SUCCESS and remain direct (not redirected)."
 echo "  - No DNS query should fail merely because the client has a fixed DNS."
 echo ""
 echo "Packet-level verification from the router while testing:"
